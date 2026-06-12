@@ -295,6 +295,44 @@ const server = http.createServer(async (req, res) => {
   proxyToMarp(req, res);
 });
 
+// Proxy WebSocket upgrades to marp. Marp's server-mode live-reload client
+// opens a WebSocket (/.__marp-cli-watch-notifier__/...) and reloads the page
+// when marp detects a change to a watched file. Without proxying the upgrade,
+// that channel never reaches marp and edits don't trigger a browser reload.
+server.on('upgrade', (req, clientSocket, clientHead) => {
+  const options = {
+    hostname: 'localhost',
+    port: MARP_PORT,
+    path: req.url,
+    method: req.method,
+    headers: { ...req.headers, host: `localhost:${MARP_PORT}` },
+  };
+  const proxyReq = http.request(options);
+
+  proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+    let resHead = `HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\n`;
+    for (let i = 0; i < proxyRes.rawHeaders.length; i += 2) {
+      resHead += `${proxyRes.rawHeaders[i]}: ${proxyRes.rawHeaders[i + 1]}\r\n`;
+    }
+    resHead += '\r\n';
+    clientSocket.write(resHead);
+    if (proxyHead && proxyHead.length) clientSocket.write(proxyHead);
+
+    proxySocket.pipe(clientSocket);
+    clientSocket.pipe(proxySocket);
+
+    const cleanup = () => { proxySocket.destroy(); clientSocket.destroy(); };
+    proxySocket.on('error', cleanup);
+    clientSocket.on('error', cleanup);
+    proxySocket.on('close', () => clientSocket.destroy());
+    clientSocket.on('close', () => proxySocket.destroy());
+  });
+
+  proxyReq.on('error', () => clientSocket.destroy());
+  if (clientHead && clientHead.length) proxyReq.write(clientHead);
+  proxyReq.end();
+});
+
 // TTL reaper: stop watching notes idle for longer than TTL_MS
 setInterval(() => {
   const now = Date.now();
