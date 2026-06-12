@@ -53,6 +53,28 @@ function fetchMarkdown(noteId) {
   });
 }
 
+// Obtain a signed session cookie from HedgeDoc. Its socket.io handshake
+// rejects connections without a valid signed connect.sid cookie (even for
+// anonymous/public notes), so we fetch one over HTTP first and reuse it in
+// the socket handshake headers.
+function getSessionCookie() {
+  return new Promise((resolve, reject) => {
+    const base = HEDGEDOC_URL.endsWith('/') ? HEDGEDOC_URL : `${HEDGEDOC_URL}/`;
+    const transport = base.startsWith('https') ? https : http;
+    transport.get(base, (res) => {
+      res.resume(); // drain
+      const setCookie = res.headers['set-cookie'];
+      if (!setCookie || setCookie.length === 0) {
+        reject(new Error('no set-cookie from HedgeDoc'));
+        return;
+      }
+      // Keep only the "name=value" part of each cookie, joined for the header.
+      const cookie = setCookie.map(c => c.split(';')[0]).join('; ');
+      resolve(cookie);
+    }).on('error', reject);
+  });
+}
+
 async function startWatch(noteId) {
   if (watched.has(noteId)) return;
 
@@ -69,8 +91,21 @@ async function startWatch(noteId) {
     console.error(`[${new Date().toISOString()}] [${noteId}] initial fetch failed: ${e.message}`);
   }
 
+  // Acquire a session cookie for the socket.io handshake (required by
+  // HedgeDoc even for public notes).
+  let cookie = '';
+  try {
+    cookie = await getSessionCookie();
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] [${noteId}] cookie fetch failed: ${e.message}`);
+  }
+
   const socket = io(HEDGEDOC_URL, {
     query: { noteId },
+    extraHeaders: cookie ? { cookie } : {},
+    transportOptions: {
+      polling: { extraHeaders: cookie ? { cookie } : {} },
+    },
     reconnection: true,
     reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
