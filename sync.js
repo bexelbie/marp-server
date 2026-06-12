@@ -53,11 +53,21 @@ function fetchMarkdown(noteId) {
   });
 }
 
-function startWatch(noteId) {
+async function startWatch(noteId) {
   if (watched.has(noteId)) return;
 
   const state = { socket: null, timer: null, lastHit: Date.now() };
   watched.set(noteId, state);
+
+  // Immediately fetch the current content via HTTP so the file exists
+  // right away, independent of the socket handshake.
+  try {
+    const markdown = await fetchMarkdown(noteId);
+    fs.writeFileSync(outFile(noteId), markdown, 'utf8');
+    log(`[${noteId}] initial fetch`);
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] [${noteId}] initial fetch failed: ${e.message}`);
+  }
 
   const socket = io(HEDGEDOC_URL, {
     query: { noteId },
@@ -184,7 +194,7 @@ function serveIndex(res) {
   res.end(html);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const p = url.pathname;
 
@@ -194,14 +204,14 @@ const server = http.createServer((req, res) => {
   if (p === '/watch') {
     const noteId = url.searchParams.get('note')?.trim();
     if (!noteId) { res.writeHead(400); return res.end('Missing note parameter'); }
-    startWatch(noteId);
+    await startWatch(noteId);
     res.writeHead(302, { Location: `/${noteId}.md` });
     return res.end();
   }
 
   const watchMatch = p.match(/^\/watch\/(.+)$/);
   if (watchMatch) {
-    startWatch(watchMatch[1]);
+    await startWatch(watchMatch[1]);
     res.writeHead(302, { Location: `/${watchMatch[1]}.md` });
     return res.end();
   }
@@ -211,6 +221,14 @@ const server = http.createServer((req, res) => {
     stopWatch(unwatchMatch[1]);
     res.writeHead(302, { Location: '/' });
     return res.end();
+  }
+
+  // Lazy auto-watch: if someone requests /{noteId}.md for a note we aren't
+  // watching yet (e.g. after a restart), start watching and fetch it now so
+  // marp can serve it on this request.
+  const mdMatch = p.match(/^\/([^/]+)\.md$/);
+  if (mdMatch && !watched.has(mdMatch[1]) && mdMatch[1] !== 'placeholder') {
+    await startWatch(mdMatch[1]);
   }
 
   proxyToMarp(req, res);
