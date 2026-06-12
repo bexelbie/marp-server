@@ -111,6 +111,62 @@ function stopWatch(noteId) {
   log(`[${noteId}] stopped`);
 }
 
+// Serve a static asset (image, etc.) that lives on disk under DATA_DIR.
+// Used so slide-referenced files like /assets/logo.svg resolve directly
+// from the bind-mounted data dir, falling through to marp otherwise.
+const MIME = {
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.avif': 'image/avif',
+  '.ico': 'image/x-icon',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.eot': 'application/vnd.ms-fontobject',
+  '.pdf': 'application/pdf',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.txt': 'text/plain; charset=utf-8',
+};
+
+// Returns the resolved on-disk path if pathname maps to an existing,
+// non-markdown file inside DATA_DIR (with traversal protection), else null.
+function resolveStatic(pathname) {
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  // Markdown is rendered by marp, never served raw here.
+  if (rel.endsWith('.md')) return null;
+  const root = path.resolve(DATA_DIR);
+  const full = path.resolve(root, '.' + (rel.startsWith('/') ? rel : '/' + rel));
+  if (full !== root && !full.startsWith(root + path.sep)) return null; // traversal guard
+  try {
+    if (fs.statSync(full).isFile()) return full;
+  } catch {}
+  return null;
+}
+
+function serveStatic(fullPath, res) {
+  const ext = path.extname(fullPath).toLowerCase();
+  const type = MIME[ext] || 'application/octet-stream';
+  res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
+  fs.createReadStream(fullPath).on('error', () => {
+    if (!res.headersSent) res.writeHead(500);
+    res.end();
+  }).pipe(res);
+}
+
 // Reverse proxy to marp (internal), touching lastHit for the note
 function proxyToMarp(req, res) {
   // Extract noteId from path (first segment) to update lastHit
@@ -230,6 +286,11 @@ const server = http.createServer(async (req, res) => {
   if (mdMatch && !watched.has(mdMatch[1]) && mdMatch[1] !== 'placeholder') {
     await startWatch(mdMatch[1]);
   }
+
+  // Static asset fall-through: if the path maps to a real file on disk
+  // under DATA_DIR (e.g. /assets/logo.svg), serve it directly.
+  const staticPath = resolveStatic(p);
+  if (staticPath) return serveStatic(staticPath, res);
 
   proxyToMarp(req, res);
 });
