@@ -61,7 +61,12 @@ function getSessionCookie() {
   return new Promise((resolve, reject) => {
     const base = HEDGEDOC_URL.endsWith('/') ? HEDGEDOC_URL : `${HEDGEDOC_URL}/`;
     const transport = base.startsWith('https') ? https : http;
-    transport.get(base, (res) => {
+    // HedgeDoc marks the session cookie Secure when behind HTTPS and only
+    // issues it when it believes the connection is secure. Internally we
+    // reach it over plain HTTP, so advertise X-Forwarded-Proto: https
+    // (HedgeDoc has trust proxy enabled) to get the Set-Cookie.
+    const options = { headers: { 'X-Forwarded-Proto': 'https' } };
+    transport.get(base, options, (res) => {
       res.resume(); // drain
       const setCookie = res.headers['set-cookie'];
       if (!setCookie || setCookie.length === 0) {
@@ -100,11 +105,14 @@ async function startWatch(noteId) {
     console.error(`[${new Date().toISOString()}] [${noteId}] cookie fetch failed: ${e.message}`);
   }
 
+  const handshakeHeaders = { 'X-Forwarded-Proto': 'https' };
+  if (cookie) handshakeHeaders.cookie = cookie;
+
   const socket = io(HEDGEDOC_URL, {
     query: { noteId },
-    extraHeaders: cookie ? { cookie } : {},
+    extraHeaders: handshakeHeaders,
     transportOptions: {
-      polling: { extraHeaders: cookie ? { cookie } : {} },
+      polling: { extraHeaders: handshakeHeaders },
     },
     reconnection: true,
     reconnectionAttempts: Infinity,
