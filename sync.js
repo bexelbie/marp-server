@@ -71,7 +71,6 @@ async function startWatch(noteId) {
 
   const socket = io(HEDGEDOC_URL, {
     query: { noteId },
-    transports: ['websocket'],
     reconnection: true,
     reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
@@ -80,6 +79,8 @@ async function startWatch(noteId) {
 
   socket.on('connect', () => log(`[${noteId}] connected`));
   socket.on('disconnect', reason => log(`[${noteId}] disconnected (${reason})`));
+  socket.on('connect_error', err => log(`[${noteId}] connect_error: ${err.message}`));
+  socket.io.on('error', err => log(`[${noteId}] engine error: ${err.message}`));
 
   socket.on('doc', data => {
     const markdown = typeof data?.str === 'string' ? data.str : '';
