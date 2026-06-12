@@ -32,7 +32,7 @@ else
 fi
 
 # shellcheck disable=SC2086
-PORT=8081 marp -s -I /data/ --allow-local-files $THEMES_ARG
+PORT=8081 marp -s -I /data/ --html --allow-local-files $THEMES_ARG
 MARP_EXIT=$?
 
 cleanup
