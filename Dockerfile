@@ -12,7 +12,7 @@ COPY start.sh ./
 RUN chmod +x /app/start.sh
 
 RUN mkdir -p /data /themes
-COPY placeholder.md /data/.placeholder.md
+COPY placeholder.md /data/placeholder.md
 
 EXPOSE 8080
 

@@ -27,7 +27,8 @@ if [ "$(ls /themes/*.css 2>/dev/null | wc -l)" -gt 0 ]; then
 fi
 
 # shellcheck disable=SC2086
-marp --server /data/ --port 8081 --allow-local-files $THEMES_ARG
+export PORT=8081
+marp -s -I /data/ --allow-local-files $THEMES_ARG
 MARP_EXIT=$?
 
 cleanup
