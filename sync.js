@@ -104,7 +104,8 @@ function stopWatch(noteId) {
 // Reverse proxy to marp (internal), touching lastHit for the note
 function proxyToMarp(req, res) {
   // Extract noteId from path (first segment) to update lastHit
-  const noteId = req.url.split('/').filter(Boolean)[0];
+  const segment = req.url.split('/').filter(Boolean)[0] || '';
+  const noteId = segment.endsWith('.md') ? segment.slice(0, -3) : segment;
   if (noteId && watched.has(noteId)) {
     watched.get(noteId).lastHit = Date.now();
   }
@@ -140,7 +141,7 @@ function serveIndex(res) {
         const state = watched.get(id);
         const age = state ? Math.round((Date.now() - state.lastHit) / 60000) : '?';
         const ttlHours = Math.round(TTL_MS / 3600000);
-        return `<tr><td><a href="/${id}">${id}</a></td>` +
+        return `<tr><td><a href="/${id}.md">${id}</a></td>` +
           `<td>${age}m ago</td>` +
           `<td>expires after ${ttlHours}h idle</td>` +
           `<td><a href="/unwatch/${id}">stop</a></td></tr>`;
@@ -194,14 +195,14 @@ const server = http.createServer((req, res) => {
     const noteId = url.searchParams.get('note')?.trim();
     if (!noteId) { res.writeHead(400); return res.end('Missing note parameter'); }
     startWatch(noteId);
-    res.writeHead(302, { Location: `/${noteId}` });
+    res.writeHead(302, { Location: `/${noteId}.md` });
     return res.end();
   }
 
   const watchMatch = p.match(/^\/watch\/(.+)$/);
   if (watchMatch) {
     startWatch(watchMatch[1]);
-    res.writeHead(302, { Location: `/${watchMatch[1]}` });
+    res.writeHead(302, { Location: `/${watchMatch[1]}.md` });
     return res.end();
   }
 
