@@ -21,7 +21,13 @@ trap 'cleanup; exit 0' INT TERM EXIT
 ) &
 SUPERVISOR_PID=$!
 
-marp --server /data/ --port 8081 --allow-local-files --theme-set /themes
+THEMES_ARG=""
+if [ "$(ls /themes/*.css 2>/dev/null | wc -l)" -gt 0 ]; then
+  THEMES_ARG="--theme-set /themes"
+fi
+
+# shellcheck disable=SC2086
+marp --server /data/ --port 8081 --allow-local-files $THEMES_ARG
 MARP_EXIT=$?
 
 cleanup
