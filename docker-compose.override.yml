@@ -1,0 +1,23 @@
+services:
+  marp:
+    build:
+      context: ../marp-server
+    environment:
+      HEDGEDOC_URL: http://app:3000
+      # NOTE_ID: "optional-note-id"  # pre-warm one note on startup
+      SETTLE_MS: "2000"
+      TTL_MS: "86400000"  # 24 hours in ms; set lower (e.g. 3600000) for 1h
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+    depends_on:
+      - app
+    volumes:
+      - marp_data:/data
+      # Bind-mount your local themes directory:
+      - ./themes:/themes:ro
+    restart: unless-stopped
+
+volumes:
+  marp_data:
