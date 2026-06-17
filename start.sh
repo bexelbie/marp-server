@@ -21,14 +21,16 @@ trap 'cleanup; exit 0' INT TERM EXIT
 ) &
 SUPERVISOR_PID=$!
 
-THEMES_ARG=""
+mkdir -p "${THEME_NOTES_DIR:-/theme-notes}"
+
+THEMES_ARG="--theme-set ${THEME_NOTES_DIR:-/theme-notes}"
 THEME_FILES="$(ls /themes/*.css 2>/dev/null || true)"
 if [ -n "$THEME_FILES" ]; then
-  THEMES_ARG="--theme-set /themes"
+  THEMES_ARG="$THEMES_ARG /themes"
   echo "[$(date -u +%FT%TZ)] theme-set enabled, found CSS:"
   echo "$THEME_FILES" | sed 's/^/  /'
 else
-  echo "[$(date -u +%FT%TZ)] no CSS in /themes, theme-set disabled (notes will use default theme)"
+  echo "[$(date -u +%FT%TZ)] theme-set enabled with theme notes dir only"
 fi
 
 # shellcheck disable=SC2086

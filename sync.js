@@ -11,6 +11,7 @@ const HEDGEDOC_URL = process.env.HEDGEDOC_URL || 'http://localhost:3000';
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const UPLOADS_DIR = process.env.UPLOADS_DIR || '/uploads';
 const THEMES_DIR = process.env.THEMES_DIR || '/themes';
+const THEME_NOTES_DIR = process.env.THEME_NOTES_DIR || '/theme-notes';
 const SETTLE_MS = Number(process.env.SETTLE_MS || 2000);
 const PORT = Number(process.env.PORT || 8080);
 const MARP_PORT = Number(process.env.MARP_PORT || 8081);
@@ -19,8 +20,19 @@ const TTL_CHECK_MS = 5 * 60 * 1000; // check every 5 minutes
 
 // noteId -> { socket, timer, lastHit }
 const watched = new Map();
+// themeNoteId -> { socket, timer, lastHash, themeName, cssPath, lastHit, refDecks }
+const themeWatched = new Map();
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+try {
+  fs.mkdirSync(THEME_NOTES_DIR, { recursive: true });
+} catch {
+  // The default /theme-notes path may not be writable in tests or CI.
+  // Fall back to a temp dir so theme-note mirroring still works.
+}
+const EFFECTIVE_THEME_NOTES_DIR = fs.existsSync(THEME_NOTES_DIR)
+  ? THEME_NOTES_DIR
+  : fs.mkdtempSync(path.join(os.tmpdir(), 'marp-theme-notes-'));
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -73,6 +85,86 @@ function fetchMarkdown(noteId) {
   });
 }
 
+function parseFrontMatterValue(markdown, key) {
+  const lines = markdown.split(/\r?\n/);
+  let inFrontMatter = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (i === 0 && lines[i].trim() === '---') {
+      inFrontMatter = true;
+      continue;
+    }
+    if (inFrontMatter && lines[i].trim() === '---') break;
+    if (inFrontMatter) {
+      const match = lines[i].match(new RegExp(`^${key}:\\s*(.+?)(?:\\s+#.*)?$`, 'i'));
+      if (match) {
+        const value = match[1].trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+          return value.slice(1, -1);
+        }
+        return value;
+      }
+    }
+  }
+
+  return '';
+}
+
+function parseThemeNoteId(markdown) {
+  const value = parseFrontMatterValue(markdown, 'marpThemeNote');
+  return /^[A-Za-z0-9_-]+$/.test(value) ? value : '';
+}
+
+function parseThemeName(css) {
+  const match = css.match(/\/\*\s*@theme\s+([^*]+?)\s*\*\//i);
+  return match ? match[1].trim().replace(/\s+/g, '') : '';
+}
+
+function writeThemeIfChanged(themeNoteId, css) {
+  const state = themeWatched.get(themeNoteId);
+  const name = parseThemeName(css);
+
+  if (!name || !isSafeThemeName(name)) {
+    log(`[theme ${themeNoteId}] no valid @theme name; skipping`);
+    return false;
+  }
+
+  const hash = crypto.createHash('sha1').update(css).digest('hex');
+  if (state && state.lastHash === hash && state.themeName === name) return false;
+
+  const target = path.resolve(EFFECTIVE_THEME_NOTES_DIR, `${name}.css`);
+  if (!isWithinRoot(target, EFFECTIVE_THEME_NOTES_DIR)) {
+    log(`[theme ${themeNoteId}] unsafe theme path; skipping`);
+    return false;
+  }
+
+  if (state && state.themeName && state.themeName !== name && state.cssPath) {
+    try { fs.unlinkSync(state.cssPath); } catch {}
+  }
+
+  fs.writeFileSync(target, css, 'utf8');
+  if (state) {
+    state.lastHash = hash;
+    state.themeName = name;
+    state.cssPath = target;
+  }
+  return true;
+}
+
+// Reject if a promise doesn't settle within ms. Used to bound the bundle's
+// theme fetch so a stalled HedgeDoc can't leave the temp dir uncleaned.
+// ponytail: detaches the underlying request on timeout; node's socket
+// timeout eventually closes it — fine for a manual, infrequent endpoint.
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`timeout after ${ms}ms`)), ms);
+    promise.then(
+      v => { clearTimeout(t); resolve(v); },
+      e => { clearTimeout(t); reject(e); },
+    );
+  });
+}
+
 // Obtain a signed session cookie from HedgeDoc. Its socket.io handshake
 // rejects connections without a valid signed connect.sid cookie (even for
 // anonymous/public notes), so we fetch one over HTTP first and reuse it in
@@ -100,24 +192,7 @@ function getSessionCookie() {
   });
 }
 
-async function startWatch(noteId) {
-  if (watched.has(noteId)) return;
-
-  const state = { socket: null, timer: null, lastHit: Date.now(), lastHash: null };
-  watched.set(noteId, state);
-
-  // Immediately fetch the current content via HTTP so the file exists
-  // right away, independent of the socket handshake.
-  try {
-    const markdown = await fetchMarkdown(noteId);
-    writeIfChanged(noteId, markdown);
-    log(`[${noteId}] initial fetch`);
-  } catch (e) {
-    console.error(`[${new Date().toISOString()}] [${noteId}] initial fetch failed: ${e.message}`);
-  }
-
-  // Acquire a session cookie for the socket.io handshake (required by
-  // HedgeDoc even for public notes).
+async function openNoteSocket(noteId, { onDoc, onOperation }) {
   let cookie = '';
   try {
     cookie = await getSessionCookie();
@@ -138,28 +213,50 @@ async function startWatch(noteId) {
     reconnectionAttempts: Infinity,
     reconnectionDelay: 1000,
   });
-  state.socket = socket;
 
   socket.on('connect', () => log(`[${noteId}] connected`));
   socket.on('disconnect', reason => log(`[${noteId}] disconnected (${reason})`));
   socket.on('connect_error', err => log(`[${noteId}] connect_error: ${err.message}`));
   socket.io.on('error', err => log(`[${noteId}] engine error: ${err.message}`));
 
-  socket.on('doc', data => {
-    const markdown = typeof data?.str === 'string' ? data.str : '';
-    if (writeIfChanged(noteId, markdown)) log(`[${noteId}] initial sync`);
-  });
+  socket.on('doc', data => onDoc(typeof data?.str === 'string' ? data.str : ''));
+  socket.on('operation', () => onOperation());
 
-  socket.on('operation', () => {
-    if (state.timer) clearTimeout(state.timer);
-    state.timer = setTimeout(async () => {
-      try {
-        const markdown = await fetchMarkdown(noteId);
-        if (writeIfChanged(noteId, markdown)) log(`[${noteId}] synced`);
-      } catch (e) {
-        console.error(`[${new Date().toISOString()}] [${noteId}] fetch failed: ${e.message}`);
-      }
-    }, SETTLE_MS);
+  return socket;
+}
+
+async function startWatch(noteId) {
+  if (watched.has(noteId)) return;
+
+  const state = { socket: null, timer: null, lastHit: Date.now(), lastHash: null };
+  watched.set(noteId, state);
+
+  try {
+    const markdown = await fetchMarkdown(noteId);
+    writeIfChanged(noteId, markdown);
+    ensureThemeWatch(parseThemeNoteId(markdown), noteId);
+    log(`[${noteId}] initial fetch`);
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] [${noteId}] initial fetch failed: ${e.message}`);
+  }
+
+  state.socket = await openNoteSocket(noteId, {
+    onDoc: markdown => {
+      if (writeIfChanged(noteId, markdown)) log(`[${noteId}] initial sync`);
+      ensureThemeWatch(parseThemeNoteId(markdown), noteId);
+    },
+    onOperation: () => {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = setTimeout(async () => {
+        try {
+          const markdown = await fetchMarkdown(noteId);
+          if (writeIfChanged(noteId, markdown)) log(`[${noteId}] synced`);
+          ensureThemeWatch(parseThemeNoteId(markdown), noteId);
+        } catch (e) {
+          console.error(`[${new Date().toISOString()}] [${noteId}] fetch failed: ${e.message}`);
+        }
+      }, SETTLE_MS);
+    },
   });
 }
 
@@ -168,9 +265,79 @@ function stopWatch(noteId) {
   if (!state) return;
   if (state.timer) clearTimeout(state.timer);
   if (state.socket) state.socket.close();
+  reconcileDeckTheme(noteId, '');
   watched.delete(noteId);
   try { fs.unlinkSync(outFile(noteId)); } catch {}
   log(`[${noteId}] stopped`);
+}
+
+// Keep the deck->theme link current. When a deck changes or drops its
+// marpThemeNote, detach it from the previous theme and stop that theme once
+// no deck still references it, so a stale theme isn't kept alive forever by
+// proxyToMarp bumping its lastHit.
+function reconcileDeckTheme(deckId, themeNoteId) {
+  const deckState = watched.get(deckId);
+  const prev = deckState ? deckState.themeNoteId : undefined;
+  if (prev && prev !== themeNoteId) {
+    const prevTheme = themeWatched.get(prev);
+    if (prevTheme) {
+      prevTheme.refDecks.delete(deckId);
+      if (prevTheme.refDecks.size === 0) stopThemeWatch(prev);
+    }
+  }
+  if (deckState) deckState.themeNoteId = themeNoteId || null;
+}
+
+async function ensureThemeWatch(themeNoteId, deckId) {
+  reconcileDeckTheme(deckId, themeNoteId);
+  if (!themeNoteId) return;
+
+  let state = themeWatched.get(themeNoteId);
+  if (state) {
+    state.refDecks.add(deckId);
+    state.lastHit = Date.now();
+    return;
+  }
+
+  state = { socket: null, timer: null, lastHash: null, themeName: null, cssPath: null, lastHit: Date.now(), refDecks: new Set([deckId]) };
+  themeWatched.set(themeNoteId, state);
+
+  try {
+    const css = await fetchMarkdown(themeNoteId);
+    writeThemeIfChanged(themeNoteId, css);
+    log(`[theme ${themeNoteId}] initial fetch`);
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] [theme ${themeNoteId}] initial fetch failed: ${e.message}`);
+  }
+
+  state.socket = await openNoteSocket(themeNoteId, {
+    onDoc: css => {
+      if (writeThemeIfChanged(themeNoteId, css)) log(`[theme ${themeNoteId}] synced`);
+    },
+    onOperation: () => {
+      if (state.timer) clearTimeout(state.timer);
+      state.timer = setTimeout(async () => {
+        try {
+          const css = await fetchMarkdown(themeNoteId);
+          if (writeThemeIfChanged(themeNoteId, css)) log(`[theme ${themeNoteId}] synced`);
+        } catch (e) {
+          console.error(`[${new Date().toISOString()}] [theme ${themeNoteId}] fetch failed: ${e.message}`);
+        }
+      }, SETTLE_MS);
+    },
+  });
+}
+
+function stopThemeWatch(themeNoteId) {
+  const state = themeWatched.get(themeNoteId);
+  if (!state) return;
+  if (state.timer) clearTimeout(state.timer);
+  if (state.socket) state.socket.close();
+  themeWatched.delete(themeNoteId);
+  if (state.cssPath) {
+    try { fs.unlinkSync(state.cssPath); } catch {}
+  }
+  log(`[theme ${themeNoteId}] stopped`);
 }
 
 // Serve a static asset (image, etc.) that lives on disk under DATA_DIR.
@@ -329,19 +496,8 @@ function bundleEntries(noteId) {
   }
 
   const themeName = (() => {
-    const lines = markdown.split(/\r?\n/);
-    let inFrontMatter = false;
-    for (let i = 0; i < lines.length; i++) {
-      if (i === 0 && lines[i].trim() === '---') {
-        inFrontMatter = true;
-        continue;
-      }
-      if (inFrontMatter && lines[i].trim() === '---') break;
-      if (inFrontMatter) {
-        const match = lines[i].match(/^theme:\s*(\S+)/i);
-        if (match) return match[1].trim().replace(/\.css$/i, '');
-      }
-    }
+    const frontMatterTheme = parseFrontMatterValue(markdown, 'theme');
+    if (frontMatterTheme) return frontMatterTheme.trim().replace(/\.css$/i, '');
     const commentMatch = markdown.match(/<!--\s*theme:\s*([^\s>]+)\s*-->/i);
     return commentMatch ? commentMatch[1].trim().replace(/\.css$/i, '') : '';
   })();
@@ -374,7 +530,7 @@ function bundleEntries(noteId) {
   return entries;
 }
 
-function serveBundle(noteId, res) {
+async function serveBundle(noteId, res) {
   const noteFile = outFile(noteId);
   if (!fs.existsSync(noteFile) || !fs.statSync(noteFile).isFile()) {
     res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -392,6 +548,24 @@ function serveBundle(noteId, res) {
       if (!isWithinRoot(target, root)) continue;
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.copyFileSync(entry.source, target);
+    }
+
+    const markdown = fs.readFileSync(noteFile, 'utf8');
+    const themeNoteId = parseThemeNoteId(markdown);
+    if (themeNoteId) {
+      try {
+        const css = await withTimeout(fetchMarkdown(themeNoteId), 10000);
+        const name = parseThemeName(css) || parseFrontMatterValue(markdown, 'theme').replace(/\.css$/i, '');
+        if (isSafeThemeName(name)) {
+          const themeTarget = path.resolve(root, 'themes', `${name}.css`);
+          if (isWithinRoot(themeTarget, root)) {
+            fs.mkdirSync(path.dirname(themeTarget), { recursive: true });
+            fs.writeFileSync(themeTarget, css, 'utf8');
+          }
+        }
+      } catch (e) {
+        log(`[${noteId}] theme bundle fetch failed: ${e.message}`);
+      }
     }
 
     const tar = spawn('tar', ['-czf', '-', '-C', dir, '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -429,7 +603,11 @@ function proxyToMarp(req, res) {
   const segment = req.url.split('/').filter(Boolean)[0] || '';
   const noteId = segment.endsWith('.md') ? segment.slice(0, -3) : segment;
   if (noteId && watched.has(noteId)) {
-    watched.get(noteId).lastHit = Date.now();
+    const state = watched.get(noteId);
+    state.lastHit = Date.now();
+    if (state.themeNoteId && themeWatched.has(state.themeNoteId)) {
+      themeWatched.get(state.themeNoteId).lastHit = Date.now();
+    }
   }
 
   const options = {
@@ -513,7 +691,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/') return serveIndex(res);
 
   const bundleMatch = p.match(/^\/([^/]+)\/bundle\.tar\.gz$/);
-  if (bundleMatch) return serveBundle(bundleMatch[1], res);
+  if (bundleMatch) return await serveBundle(bundleMatch[1], res);
 
   // /watch?note=abc  or  /watch/abc
   if (p === '/watch') {
@@ -606,10 +784,17 @@ setInterval(() => {
       stopWatch(noteId);
     }
   }
+  for (const [themeNoteId, state] of themeWatched.entries()) {
+    if (now - state.lastHit > TTL_MS) {
+      log(`[theme ${themeNoteId}] TTL expired, stopping theme watch`);
+      stopThemeWatch(themeNoteId);
+    }
+  }
 }, TTL_CHECK_MS).unref();
 
 function shutdown() {
   for (const noteId of watched.keys()) stopWatch(noteId);
+  for (const themeNoteId of themeWatched.keys()) stopThemeWatch(themeNoteId);
   server.close();
   process.exit(0);
 }
@@ -628,4 +813,16 @@ if (require.main === module) {
   process.on('SIGTERM', shutdown);
 }
 
-module.exports = { writeIfChanged, watched, outFile, resolveUpload, bundleEntries };
+module.exports = {
+  writeIfChanged,
+  watched,
+  outFile,
+  resolveUpload,
+  bundleEntries,
+  parseFrontMatterValue,
+  parseThemeNoteId,
+  parseThemeName,
+  writeThemeIfChanged,
+  themeWatched,
+  reconcileDeckTheme,
+};
