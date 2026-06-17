@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+const crypto = require('crypto');
 const { io } = require('socket.io-client');
 
 const HEDGEDOC_URL = process.env.HEDGEDOC_URL || 'http://localhost:3000';
@@ -23,6 +24,21 @@ function log(msg) {
 
 function outFile(noteId) {
   return path.join(DATA_DIR, `${noteId}.md`);
+}
+
+// Write only when content actually changed. marp watches mtime, so an
+// identical rewrite (e.g. the `doc` snapshot replayed on every socket
+// reconnect) would bump mtime and force a browser reload that drops the
+// presenter out of fullscreen. Comparing a stored hash keeps reloads tied
+// to real edits. State (~32 bytes/note) lives in the watched Map.
+// ponytail: sha1 of last write; a real change on reconnect differs and still writes.
+function writeIfChanged(noteId, markdown) {
+  const state = watched.get(noteId);
+  const hash = crypto.createHash('sha1').update(markdown).digest('hex');
+  if (state && state.lastHash === hash) return false;
+  fs.writeFileSync(outFile(noteId), markdown, 'utf8');
+  if (state) state.lastHash = hash;
+  return true;
 }
 
 function fetchMarkdown(noteId) {
@@ -83,14 +99,14 @@ function getSessionCookie() {
 async function startWatch(noteId) {
   if (watched.has(noteId)) return;
 
-  const state = { socket: null, timer: null, lastHit: Date.now() };
+  const state = { socket: null, timer: null, lastHit: Date.now(), lastHash: null };
   watched.set(noteId, state);
 
   // Immediately fetch the current content via HTTP so the file exists
   // right away, independent of the socket handshake.
   try {
     const markdown = await fetchMarkdown(noteId);
-    fs.writeFileSync(outFile(noteId), markdown, 'utf8');
+    writeIfChanged(noteId, markdown);
     log(`[${noteId}] initial fetch`);
   } catch (e) {
     console.error(`[${new Date().toISOString()}] [${noteId}] initial fetch failed: ${e.message}`);
@@ -127,8 +143,7 @@ async function startWatch(noteId) {
 
   socket.on('doc', data => {
     const markdown = typeof data?.str === 'string' ? data.str : '';
-    fs.writeFileSync(outFile(noteId), markdown, 'utf8');
-    log(`[${noteId}] initial sync`);
+    if (writeIfChanged(noteId, markdown)) log(`[${noteId}] initial sync`);
   });
 
   socket.on('operation', () => {
@@ -136,8 +151,7 @@ async function startWatch(noteId) {
     state.timer = setTimeout(async () => {
       try {
         const markdown = await fetchMarkdown(noteId);
-        fs.writeFileSync(outFile(noteId), markdown, 'utf8');
-        log(`[${noteId}] synced`);
+        if (writeIfChanged(noteId, markdown)) log(`[${noteId}] synced`);
       } catch (e) {
         console.error(`[${new Date().toISOString()}] [${noteId}] fetch failed: ${e.message}`);
       }
@@ -388,20 +402,24 @@ setInterval(() => {
   }
 }, TTL_CHECK_MS).unref();
 
-server.listen(PORT, () => log(`listening on :${PORT}, marp on :${MARP_PORT}`));
-
-// Pre-warm a note if NOTE_ID is set at startup
-const preWarm = process.env.NOTE_ID?.trim();
-if (preWarm) {
-  log(`pre-warming note: ${preWarm}`);
-  startWatch(preWarm);
-}
-
 function shutdown() {
   for (const noteId of watched.keys()) stopWatch(noteId);
   server.close();
   process.exit(0);
 }
 
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+if (require.main === module) {
+  server.listen(PORT, () => log(`listening on :${PORT}, marp on :${MARP_PORT}`));
+
+  // Pre-warm a note if NOTE_ID is set at startup
+  const preWarm = process.env.NOTE_ID?.trim();
+  if (preWarm) {
+    log(`pre-warming note: ${preWarm}`);
+    startWatch(preWarm);
+  }
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
+module.exports = { writeIfChanged, watched, outFile };
