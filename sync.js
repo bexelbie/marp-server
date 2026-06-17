@@ -1,12 +1,16 @@
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 const { io } = require('socket.io-client');
 
 const HEDGEDOC_URL = process.env.HEDGEDOC_URL || 'http://localhost:3000';
 const DATA_DIR = process.env.DATA_DIR || '/data';
+const UPLOADS_DIR = process.env.UPLOADS_DIR || '/uploads';
+const THEMES_DIR = process.env.THEMES_DIR || '/themes';
 const SETTLE_MS = Number(process.env.SETTLE_MS || 2000);
 const PORT = Number(process.env.PORT || 8080);
 const MARP_PORT = Number(process.env.MARP_PORT || 8081);
@@ -197,6 +201,16 @@ const MIME = {
 
 // Returns the resolved on-disk path if pathname maps to an existing,
 // non-markdown file inside DATA_DIR (with traversal protection), else null.
+function isWithinRoot(fullPath, rootDir) {
+  const root = path.resolve(rootDir);
+  const full = path.resolve(fullPath);
+  return full === root || full.startsWith(root + path.sep);
+}
+
+function isSafeThemeName(themeName) {
+  return /^[A-Za-z0-9._-]+$/.test(themeName) && !themeName.includes('..') && themeName !== '.' && themeName !== '..';
+}
+
 function resolveStatic(pathname) {
   let rel;
   try {
@@ -208,7 +222,7 @@ function resolveStatic(pathname) {
   if (rel.endsWith('.md')) return null;
   const root = path.resolve(DATA_DIR);
   const full = path.resolve(root, '.' + (rel.startsWith('/') ? rel : '/' + rel));
-  if (full !== root && !full.startsWith(root + path.sep)) return null; // traversal guard
+  if (!isWithinRoot(full, root)) return null;
   try {
     if (fs.statSync(full).isFile()) return full;
   } catch {}
@@ -223,6 +237,190 @@ function serveStatic(fullPath, res) {
     if (!res.headersSent) res.writeHead(500);
     res.end();
   }).pipe(res);
+}
+
+function resolveUpload(pathname) {
+  let rel;
+  try {
+    rel = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (rel.includes('\\')) return null;
+  if (rel.endsWith('.md')) return null;
+  const root = path.resolve(UPLOADS_DIR);
+  const uploadsPrefix = '/uploads/';
+  const withoutPrefix = rel.startsWith(uploadsPrefix) ? rel.slice(uploadsPrefix.length) : rel;
+  const full = path.resolve(root, withoutPrefix);
+  if (!isWithinRoot(full, root)) return null;
+  try {
+    if (fs.statSync(full).isFile()) return full;
+  } catch {}
+  return null;
+}
+
+function bundleEntries(noteId) {
+  const entries = [];
+  const seen = new Set();
+  const noteFile = outFile(noteId);
+
+  function addFile(name, source) {
+    if (!source || !name) return;
+    if (seen.has(name)) return;
+    if (!fs.existsSync(source)) return;
+    entries.push({ name, source });
+    seen.add(name);
+  }
+
+  addFile(`${noteId}.md`, noteFile);
+
+  const markdown = fs.existsSync(noteFile) ? fs.readFileSync(noteFile, 'utf8') : '';
+  const refs = new Set();
+
+  const mdImageRe = /!\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)/g;
+  for (const match of markdown.matchAll(mdImageRe)) {
+    refs.add(match[1]);
+  }
+
+  const htmlImageRe = /<img\b[^>]*\bsrc=(['"])(.*?)\1[^>]*>/gi;
+  for (const match of markdown.matchAll(htmlImageRe)) {
+    refs.add(match[2]);
+  }
+
+  const cssUrlRe = /url\(\s*(['"]?)([^'"\)\s]+)\1\s*\)/gi;
+  for (const match of markdown.matchAll(cssUrlRe)) {
+    refs.add(match[2]);
+  }
+
+  for (const ref of refs) {
+    const raw = ref.trim();
+    if (!raw) continue;
+    if (/^https?:\/\//i.test(raw) || /^\/\/[^/]/i.test(raw) || /^data:/i.test(raw)) continue;
+
+    const cut = raw.split(/[?#]/, 1)[0];
+    if (!cut) continue;
+
+    let decoded;
+    try {
+      decoded = decodeURIComponent(cut);
+    } catch {
+      continue;
+    }
+    if (decoded.includes('\\')) continue;
+
+    const normalized = decoded.startsWith('/') ? decoded.slice(1) : decoded;
+    if (!normalized) continue;
+
+    let source;
+    if (normalized.startsWith('uploads/')) {
+      const rel = normalized.slice('uploads/'.length);
+      const root = path.resolve(UPLOADS_DIR);
+      const full = path.resolve(root, rel);
+      if (!isWithinRoot(full, root)) continue;
+      source = full;
+    } else {
+      const root = path.resolve(DATA_DIR);
+      const full = path.resolve(root, normalized);
+      if (!isWithinRoot(full, root)) continue;
+      source = full;
+    }
+    if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
+    addFile(normalized, source);
+  }
+
+  const themeName = (() => {
+    const lines = markdown.split(/\r?\n/);
+    let inFrontMatter = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (i === 0 && lines[i].trim() === '---') {
+        inFrontMatter = true;
+        continue;
+      }
+      if (inFrontMatter && lines[i].trim() === '---') break;
+      if (inFrontMatter) {
+        const match = lines[i].match(/^theme:\s*(\S+)/i);
+        if (match) return match[1].trim().replace(/\.css$/i, '');
+      }
+    }
+    const commentMatch = markdown.match(/<!--\s*theme:\s*([^\s>]+)\s*-->/i);
+    return commentMatch ? commentMatch[1].trim().replace(/\.css$/i, '') : '';
+  })();
+
+  if (themeName) {
+    const safeThemeName = themeName.trim();
+    if (isSafeThemeName(safeThemeName)) {
+      const themesRoot = path.resolve(THEMES_DIR);
+      const direct = path.resolve(themesRoot, `${safeThemeName}.css`);
+      if (isWithinRoot(direct, themesRoot) && fs.existsSync(direct) && fs.statSync(direct).isFile()) {
+        addFile(`themes/${safeThemeName}.css`, direct);
+      } else {
+        try {
+          const list = fs.readdirSync(themesRoot).filter(f => f.toLowerCase().endsWith('.css'));
+          for (const file of list) {
+            const full = path.resolve(themesRoot, file);
+            if (!isWithinRoot(full, themesRoot) || !fs.statSync(full).isFile()) continue;
+            const css = fs.readFileSync(full, 'utf8');
+            const match = css.match(/\/\*\s*@theme\s+([^*]+?)\s*\*\//i);
+            if (match && match[1].replace(/\s+/g, '').toLowerCase() === safeThemeName.replace(/\s+/g, '').toLowerCase()) {
+              addFile(`themes/${safeThemeName}.css`, full);
+              break;
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return entries;
+}
+
+function serveBundle(noteId, res) {
+  const noteFile = outFile(noteId);
+  if (!fs.existsSync(noteFile) || !fs.statSync(noteFile).isFile()) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not found');
+    return;
+  }
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'marp-bundle-'));
+  const cleanup = () => fs.rmSync(dir, { recursive: true, force: true });
+
+  try {
+    const root = path.resolve(dir);
+    for (const entry of bundleEntries(noteId)) {
+      const target = path.resolve(root, entry.name);
+      if (!isWithinRoot(target, root)) continue;
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(entry.source, target);
+    }
+
+    const tar = spawn('tar', ['-czf', '-', '-C', dir, '.'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    res.writeHead(200, {
+      'Content-Type': 'application/gzip',
+      'Content-Disposition': `attachment; filename="${noteId}.tar.gz"`,
+    });
+
+    tar.stdout.on('data', chunk => res.write(chunk));
+    tar.stderr.on('data', () => {});
+    tar.on('error', () => {
+      cleanup();
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
+    tar.on('close', code => {
+      cleanup();
+      if (code !== 0) {
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      } else {
+        res.end();
+      }
+    });
+  } catch (e) {
+    cleanup();
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bundle failed');
+  }
 }
 
 // Reverse proxy to marp (internal), touching lastHit for the note
@@ -314,6 +512,9 @@ const server = http.createServer(async (req, res) => {
 
   if (p === '/') return serveIndex(res);
 
+  const bundleMatch = p.match(/^\/([^/]+)\/bundle\.tar\.gz$/);
+  if (bundleMatch) return serveBundle(bundleMatch[1], res);
+
   // /watch?note=abc  or  /watch/abc
   if (p === '/watch') {
     const noteId = url.searchParams.get('note')?.trim();
@@ -335,6 +536,11 @@ const server = http.createServer(async (req, res) => {
     stopWatch(unwatchMatch[1]);
     res.writeHead(302, { Location: '/' });
     return res.end();
+  }
+
+  if (p.startsWith('/uploads/')) {
+    const up = resolveUpload(p);
+    if (up) return serveStatic(up, res);
   }
 
   // Lazy auto-watch: if someone requests /{noteId}.md for a note we aren't
@@ -422,4 +628,4 @@ if (require.main === module) {
   process.on('SIGTERM', shutdown);
 }
 
-module.exports = { writeIfChanged, watched, outFile };
+module.exports = { writeIfChanged, watched, outFile, resolveUpload, bundleEntries };

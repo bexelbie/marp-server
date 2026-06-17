@@ -2,7 +2,7 @@
   "name": "marp-sync",
   "private": true,
   "scripts": {
-    "test": "node test/writeIfChanged.test.js"
+    "test": "node test/writeIfChanged.test.js && node test/bundle.test.js"
   },
   "dependencies": {
     "socket.io-client": "^4.8.1"
