@@ -11,7 +11,7 @@ COPY sync.js ./
 COPY start.sh ./
 RUN chmod +x /app/start.sh
 
-RUN mkdir -p /data /themes
+RUN mkdir -p /data /themes /theme-notes && chmod 0777 /theme-notes
 COPY placeholder.md /data/placeholder.md
 
 EXPOSE 8080
